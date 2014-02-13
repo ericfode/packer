@@ -31,7 +31,8 @@ type Config struct {
 	RunList           []string `mapstructure:"run_list"`
 	SkipInstall       bool     `mapstructure:"skip_install"`
 	StagingDir        string   `mapstructure:"staging_directory"`
-
+        Environment       string   `mapstructure:"chef_environment"`
+        Databag           string   `mapstructure:"encrypted_data_bag_secret_path"`
 	tpl *packer.ConfigTemplate
 }
 
@@ -42,7 +43,8 @@ type Provisioner struct {
 type ConfigTemplate struct {
 	NodeName  string
 	ServerUrl string
-
+        Environment string
+        Databag     string
 	// Templates don't support boolean statements until Go 1.2. In the
 	// mean time, we do this.
 	// TODO(mitchellh): Remove when Go 1.2 is released
@@ -95,6 +97,13 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 		p.config.StagingDir = "/tmp/packer-chef-client"
 	}
 
+        if p.config.Environment == "" {
+		p.config.Environment = "staging"
+	}
+
+	if p.config.Databag == "" {
+		p.config.Databag= "/etc/chef/encrypted_data_bag_secret"
+	}
 	// Accumulate any errors
 	errs := common.CheckUnusedConfig(md)
 
@@ -175,12 +184,13 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 			return fmt.Errorf("Error installing Chef: %s", err)
 		}
 	}
-	if err := p.moveClient(ui, comm); err != nil {
-		return fmt.Errorf("Error moving client.rb: %s", err)
+
+        if err := p.uploadDirectory(ui,comm, p.config.StagingDir, p.config.StagingDir); err != nil {
+		return fmt.Errorf("Error uploading staging directory: %s", err)
 	}
 
-	if err := p.createDir(ui, comm, p.config.StagingDir); err != nil {
-		return fmt.Errorf("Error creating staging directory: %s", err)
+	if err := p.moveClient(ui, comm); err != nil {
+		return fmt.Errorf("Error moving client.rb: %s", err)
 	}
 
 	if err := p.createHints(ui, comm); err != nil {
@@ -190,6 +200,12 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 	if err := p.moveValidation(ui, comm); err != nil {
 		return fmt.Errorf("Error moving validation.pem: %s", err)
 	}
+
+	if err := p.moveEncrypted(ui, comm); err != nil {
+		return fmt.Errorf("Error moving validation.pem: %s", err)
+	}
+
+
 
 	nodeName := ""
 	if p.config.NodeName != "" {
@@ -223,13 +239,13 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 		return fmt.Errorf("Error executing Chef: %s", err)
 	}
 
-	if err := p.cleanNode(ui, comm, p.config.NodeName); err != nil {
-		return fmt.Errorf("Error cleaning up chef node: %s", err)
-	}
+        //	if err := p.cleanNode(ui, comm, p.config.NodeName); err != nil {
+        //	return fmt.Errorf("Error cleaning up chef node: %s", err)
+	//}
 
-	if err := p.cleanClient(ui, comm, p.config.NodeName); err != nil {
-		return fmt.Errorf("Error cleaning up chef client: %s", err)
-	}
+	//if err := p.cleanClient(ui, comm, p.config.NodeName); err != nil {
+//		return fmt.Errorf("Error cleaning up chef client: %s", err)
+//	}
 
 	if err := p.removeDir(ui, comm, p.config.StagingDir); err != nil {
 		return fmt.Errorf("Error removing /etc/chef directory: %s", err)
@@ -281,6 +297,8 @@ func (p *Provisioner) createConfig(ui packer.Ui, comm packer.Communicator, nodeN
 	configString, err := p.config.tpl.Process(tpl, &ConfigTemplate{
 		NodeName:    nodeName,
 		ServerUrl:   serverUrl,
+                Environment: p.config.Environment,
+                Databag:     p.config.Databag,
 		HasNodeName: nodeName != "",
 	})
 	if err != nil {
@@ -310,6 +328,9 @@ func (p *Provisioner) createJson(ui packer.Ui, comm packer.Communicator) (string
 		jsonData["run_list"] = p.config.RunList
 	}
 
+        // Set the environment if it was listed
+        jsonData["chef_environment"] = p.config.Environment
+
 	jsonBytes, err := json.MarshalIndent(jsonData, "", "  ")
 	if err != nil {
 		return "", err
@@ -327,7 +348,7 @@ func (p *Provisioner) createJson(ui packer.Ui, comm packer.Communicator) (string
 func (p *Provisioner) createDir(ui packer.Ui, comm packer.Communicator, dir string) error {
 	ui.Message(fmt.Sprintf("Creating directory: %s", dir))
 	cmd := &packer.RemoteCmd{
-		Command: fmt.Sprintf("sudo mkdir -p '%s' && sudo chown ubuntu '%s'", dir, dir),
+		Command: fmt.Sprintf("mkdir -p '%s'" , dir),
 	}
 
 	if err := cmd.StartWithUi(comm, ui); err != nil {
@@ -472,6 +493,23 @@ func (p *Provisioner) moveValidation(ui packer.Ui, comm packer.Communicator) err
 	return nil
 }
 
+func (p *Provisioner) moveEncrypted(ui packer.Ui, comm packer.Communicator) error {
+	ui.Message("Moving encrypted databag stuff..")
+
+        command := "mv /tmp/packer-chef-client/encrypted_data_bag_secret /etc/chef/encrypted_data_bag_secret"
+	cmd := &packer.RemoteCmd{Command: command}
+	if err := cmd.StartWithUi(comm, ui); err != nil {
+		return err
+	}
+
+	if cmd.ExitStatus != 0 {
+		return fmt.Errorf(
+			"Move script exited with non-zero exit status %d", cmd.ExitStatus)
+	}
+
+	return nil
+}
+
 func (p *Provisioner) moveClient(ui packer.Ui, comm packer.Communicator) error {
 	ui.Message("Moving client.rb...")
 
@@ -540,6 +578,8 @@ log_level        :info
 log_location     STDOUT
 chef_server_url  "{{.ServerUrl}}"
 validation_client_name "chef-validator"
+encrypted_data_bag_secret "{{.Databag}}"
+environment               "{{.Environment}}"
 {{if .HasNodeName}}
 node_name "{{.NodeName}}"
 {{end}}
